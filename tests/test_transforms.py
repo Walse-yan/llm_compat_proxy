@@ -1,8 +1,12 @@
 from app.transforms import (
+    ThinkTagStreamFilter,
     anthropic_messages_to_openai,
+    clean_visible_text,
     normalize_openai_chat_payload,
     openai_chat_to_anthropic_message,
     openai_chat_to_response,
+    responses_to_openai_chat,
+    split_think_text,
 )
 
 
@@ -135,3 +139,119 @@ def test_openai_chat_to_response_keeps_reasoning_separate_from_answer():
     assert result["output"][1]["content"] == [
         {"type": "output_text", "text": "Final answer.", "annotations": []}
     ]
+
+
+def test_responses_to_openai_chat_forwards_tools_and_tool_outputs():
+    payload = {
+        "model": "local-model",
+        "input": [
+            {"role": "user", "content": "write file"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+        ],
+        "tools": [
+            {
+                "type": "apply_patch",
+                "description": "Apply a patch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"patch": {"type": "string"}},
+                    "required": ["patch"],
+                },
+            }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+    }
+
+    result = responses_to_openai_chat(payload, default_model="fallback")
+
+    assert result["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"patch": {"type": "string"}},
+                    "required": ["patch"],
+                },
+            },
+        }
+    ]
+    assert result["tool_choice"] == "auto"
+    assert result["parallel_tool_calls"] is False
+    assert result["messages"][-1] == {"role": "tool", "content": "done", "tool_call_id": "call_1"}
+
+
+def test_openai_chat_to_response_maps_tool_calls_to_function_call_items():
+    openai_payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {"name": "apply_patch", "arguments": "{\"patch\":\"*** Begin\"}"},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+
+    result = openai_chat_to_response(
+        openai_payload,
+        model="local-model",
+        response_id="resp_test",
+        created_at=123,
+    )
+
+    assert result["status"] == "requires_action"
+    assert result["output_text"] == ""
+    assert result["output"] == [
+        {
+            "id": "fc_test_0",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": "call_123",
+            "name": "apply_patch",
+            "arguments": "{\"patch\":\"*** Begin\"}",
+        }
+    ]
+
+
+def test_split_think_text_removes_reasoning_from_visible_content():
+    visible, reasoning = split_think_text("<think>Plan first.</think>Final answer.</think>")
+
+    assert visible == "Final answer."
+    assert reasoning == "Plan first."
+
+
+def test_clean_visible_text_removes_pseudo_tool_call_tags():
+    text = "Ready.\n<tool_call><tool_call>apply_patch<tool_call>"
+
+    assert clean_visible_text(text) == "Ready.\napply_patch"
+
+
+def test_think_tag_stream_filter_handles_split_tags():
+    stream_filter = ThinkTagStreamFilter()
+
+    first_visible, first_reasoning = stream_filter.feed("<thi")
+    second_visible, second_reasoning = stream_filter.feed("nk>hidden")
+    third_visible, third_reasoning = stream_filter.feed("</think>shown")
+    tail_visible, tail_reasoning = stream_filter.flush()
+
+    assert first_visible == ""
+    assert first_reasoning == ""
+    assert second_visible == ""
+    assert second_reasoning == ""
+    assert third_visible == ""
+    assert third_reasoning == "hidden"
+    assert tail_visible == "shown"
+    assert tail_reasoning == ""
